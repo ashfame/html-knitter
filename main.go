@@ -4,11 +4,10 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
-	_ "io"
 	"log"
-	"mime"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -21,6 +20,21 @@ type Config struct {
 	baseDir       string
 	processedURLs map[string]bool
 }
+
+// Font formats and their MIME types
+var fontMimeTypes = map[string]string{
+	".woff2": "font/woff2",
+	".woff":  "font/woff",
+	".ttf":   "font/ttf",
+	".eot":   "application/vnd.ms-fontobject",
+	".otf":   "font/otf",
+}
+
+// Regular expression to find font face rules and URLs
+var (
+	fontFaceRegex = regexp.MustCompile(`@font-face\s*{[^}]*}`)
+	fontUrlRegex  = regexp.MustCompile(`url\(['"]?(/_next/[^'"()]+)['"]?\)`)
+)
 
 func main() {
 	// Parse command line flags
@@ -120,28 +134,6 @@ func processNode(n *html.Node, config *Config) {
 	}
 }
 
-func isPreloadJS(n *html.Node) bool {
-	var rel, as string
-	for _, a := range n.Attr {
-		switch a.Key {
-		case "rel":
-			rel = a.Val
-		case "as":
-			as = a.Val
-		}
-	}
-	return rel == "preload" && as == "script"
-}
-
-func isStylesheet(n *html.Node) bool {
-	for _, a := range n.Attr {
-		if a.Key == "rel" && a.Val == "stylesheet" {
-			return true
-		}
-	}
-	return false
-}
-
 func embedCSS(n *html.Node, config *Config) {
 	var href string
 	for _, a := range n.Attr {
@@ -167,6 +159,42 @@ func embedCSS(n *html.Node, config *Config) {
 		return
 	}
 
+	// Process font face rules
+	cssString := string(cssContent)
+	fontFaces := fontFaceRegex.FindAllString(cssString, -1)
+
+	for _, fontFace := range fontFaces {
+		urls := fontUrlRegex.FindAllStringSubmatch(fontFace, -1)
+		for _, url := range urls {
+			if len(url) >= 2 {
+				fontPath := url[1]
+				fullPath := filepath.Join(config.baseDir, fontPath)
+
+				// Read font file
+				fontContent, err := os.ReadFile(fullPath)
+				if err != nil {
+					log.Printf("Warning: Could not read font file %s: %v", fullPath, err)
+					continue
+				}
+
+				// Determine MIME type
+				ext := strings.ToLower(filepath.Ext(fontPath))
+				mimeType, ok := fontMimeTypes[ext]
+				if !ok {
+					log.Printf("Warning: Unknown font type %s", ext)
+					continue
+				}
+
+				// Convert to base64
+				b64Content := base64.StdEncoding.EncodeToString(fontContent)
+				dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, b64Content)
+
+				// Replace URL in CSS
+				cssString = strings.Replace(cssString, url[1], dataURL, -1)
+			}
+		}
+	}
+
 	// Create new style node
 	styleNode := &html.Node{
 		Type: html.ElementNode,
@@ -179,12 +207,34 @@ func embedCSS(n *html.Node, config *Config) {
 	// Add CSS content
 	styleNode.AppendChild(&html.Node{
 		Type: html.TextNode,
-		Data: string(cssContent),
+		Data: cssString,
 	})
 
 	// Replace link node with style node
 	n.Parent.InsertBefore(styleNode, n)
 	n.Parent.RemoveChild(n)
+}
+
+func isPreloadJS(n *html.Node) bool {
+	var rel, as string
+	for _, a := range n.Attr {
+		switch a.Key {
+		case "rel":
+			rel = a.Val
+		case "as":
+			as = a.Val
+		}
+	}
+	return rel == "preload" && as == "script"
+}
+
+func isStylesheet(n *html.Node) bool {
+	for _, a := range n.Attr {
+		if a.Key == "rel" && a.Val == "stylesheet" {
+			return true
+		}
+	}
+	return false
 }
 
 func removeInlineJS(n *html.Node) {
@@ -210,50 +260,4 @@ func removeInlineJS(n *html.Node) {
 		}
 	}
 	n.Attr = newAttrs
-}
-
-func embedImage(n *html.Node, config *Config) {
-	var src string
-	for _, a := range n.Attr {
-		if a.Key == "src" {
-			src = a.Val
-			break
-		}
-	}
-
-	if src == "" || config.processedURLs[src] {
-		return
-	}
-
-	// Handle paths starting with /_next
-	if strings.HasPrefix(src, "/_next") {
-		src = filepath.Join(config.baseDir, src)
-	}
-
-	// Read image file
-	imgContent, err := os.ReadFile(src)
-	if err != nil {
-		log.Printf("Warning: Could not read image file %s: %v", src, err)
-		return
-	}
-
-	// Determine MIME type
-	mimeType := mime.TypeByExtension(filepath.Ext(src))
-	if mimeType == "" {
-		mimeType = "image/png" // Default to PNG if can't determine
-	}
-
-	// Convert to base64
-	b64Content := base64.StdEncoding.EncodeToString(imgContent)
-	dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, b64Content)
-
-	// Update src attribute
-	for i, a := range n.Attr {
-		if a.Key == "src" {
-			n.Attr[i].Val = dataURL
-			break
-		}
-	}
-
-	config.processedURLs[src] = true
 }
